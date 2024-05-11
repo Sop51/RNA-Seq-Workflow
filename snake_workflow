@@ -1,0 +1,177 @@
+sample=['CTLrep1','KOrep1', 'CTLrep2','KOrep2','CTLrep3','KOrep3']
+strand=['R1', 'R2']
+
+
+rule all:
+	input:
+		'quality_control/fastqc/multiqc_report.html',
+		'references/gencode.v45.annotation.gtf',
+		'references/GRCh38.primary_assembly.genome.fa',
+		'starIndextry.done',
+		expand('results/flagstat/{sample}.flagstat.txt', sample=sample),
+		'references/gencode.v45.annotation.parsed.gtf.txt',
+		'results/verse/verseFiltered.csv'
+
+
+
+
+rule fastqc:
+	input:
+		fastq = 'rna_seq_data/{sample}_{strand}.fastq.gz'
+	output:
+		fastqc = 'quality_control/fastqc/{sample}_{strand}_fastqc.html'
+	params:
+		outdir = 'quality_control/fastqc/'
+	threads: 12
+	conda:
+		'envs/fastqc_env.yml'
+	shell:
+		'''
+		fastqc -o {params.outdir} {input.fastq} 
+		'''
+
+rule multiqc:
+	input:
+		fastqc = expand('quality_control/fastqc/{sample}_{strand}_fastqc.html', sample=sample, strand=strand)
+	output:
+		report = 'quality_control/fastqc/multiqc_report.html'
+	params:
+		outdir = 'quality_control/fastqc/'
+	conda:
+		'envs/multiqc_env.yml'
+	shell:
+		'''
+		multiqc {params.outdir} -o {params.outdir}
+		'''
+
+rule get_gtf:
+	output:
+		gtf_file = 'references/gencode.v45.annotation.gtf.gz'
+	params:
+		 outdir = 'references/'
+	shell:
+		'''
+		wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/gencode.v45.annotation.gtf.gz -P {params.outdir}
+		'''
+
+rule unzip_gtf:
+	input:
+		gtf_file = 'references/gencode.v45.annotation.gtf.gz'
+	output:
+		gtf_unzipped = 'references/gencode.v45.annotation.gtf'
+	shell:
+		'''
+		gunzip {input.gtf_file}
+		'''
+
+rule get_fasta:
+	output:
+		fasta_file = 'references/GRCh38.primary_assembly.genome.fa.gz'
+	params:
+		outdir = 'references/'
+	shell:
+		'''
+		wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_45/GRCh38.primary_assembly.genome.fa.gz -P {params.outdir}
+		'''
+
+rule unzip_fasta:
+	input:
+		fasta_file = 'references/GRCh38.primary_assembly.genome.fa.gz'
+	output:
+		fasta_unzipped = 'references/GRCh38.primary_assembly.genome.fa'
+	shell:
+		'''
+		gunzip {input.fasta_file}
+		'''
+
+rule star_index:
+	input:
+		fasta = 'references/GRCh38.primary_assembly.genome.fa',
+		gtf = 'references/gencode.v45.annotation.gtf'
+	output:
+		touch('starIndextry.done')
+	params:
+		runmode = 'genomeGenerate',
+		outdir = 'references/star_index/'
+	threads: 16
+	conda:
+		'envs/star_env.yml'
+	shell:
+		'''
+		STAR --runThreadN {threads} --runMode {params.runmode} --genomeDir {params.outdir} --genomeFastaFiles {input.fasta} --sjdbGTFfile {input.gtf} --sjdbOverhang 100
+		'''
+
+rule star:
+	input:
+		fastq1 = 'rna_seq_data/{sample}_R1.fastq.gz',
+		fastq2 = 'rna_seq_data/{sample}_R2.fastq.gz',
+		star = 'starIndextry.done'
+	output:
+		output = 'results/aligned_bams_STAR/{sample}.Aligned.out.bam'
+	params:
+		genomeDir = 'references/star_index/',
+		outdir = 'results/aligned_bams_STAR/{sample}.'
+	threads: 8
+	conda:
+		'envs/star_env.yml'
+	shell:
+		'''
+		STAR --runThreadN {threads} --genomeDir {params.genomeDir} --readFilesIn <(gunzip -c {input.fastq1} {input.fastq2}) --outFileNamePrefix {params.outdir} --outSAMtype BAM Unsorted
+		'''
+
+rule samtools_flagstat:
+	input:
+		bams = 'results/aligned_bams_STAR/{sample}.Aligned.out.bam'
+	output:
+		outdir = 'results/flagstat/{sample}.flagstat.txt'
+	conda:
+		'envs/samtools_env.yml'
+	shell:
+		'''
+		samtools flagstat {input.bams} > {output.outdir}
+		'''
+
+rule parse_gtf:
+	input:
+		'python_files/parseGTF.py'
+	output:
+		'references/gencode.v45.annotation.parsed.gtf.txt'
+	shell:
+		'''
+		python3 {input}
+		'''
+
+rule verse:
+	input:
+		gtf = 'references/gencode.v45.annotation.gtf',
+		bams = 'results/aligned_bams_STAR/{sample}.Aligned.out.bam'
+	output:
+		'results/verse/{sample}.exon.txt'
+	params:
+		outdir = 'results/verse/{sample}'
+	conda:
+		'envs/verse_env.yml'
+	shell:
+		'''
+		verse -S -a {input.gtf} -o {params.outdir} {input.bams}
+		'''
+
+rule concat_verse:
+	input:
+		dfs = expand('results/verse/{sample}.exon.txt', sample=sample)
+	output:
+		concat = 'results/verse/verse_concact.txt'
+	shell:
+		'''
+		python3 python_files/concatVerse.py -i {input.dfs} -o {output.concat}
+		'''
+
+rule filter_verse:
+	input:
+		'results/verse/verse_concact.txt'
+	output:
+		'results/verse/verseFiltered.csv'
+	shell:
+		'''
+		python3 python_files/filterCounts.py -i {input} -o {output}
+		'''
