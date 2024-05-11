@@ -1,0 +1,238 @@
+---
+title: "RNASeqFinalProject-BF528"
+author: "Sophia Marcotte"
+date: "2024-04-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Sequence Alignment Quality Discussion:
+
+Reads: Overall, the quality of the reads looks fairly okay. The only thing that I would be concerned about is duplicate reads. All of the different samples appear to have about 75% duplication rates. All other metrics seem to be okay.
+
+Alignment: The alignment quality I obtained was great! I had an 100% mapping rate for my reads.
+
+Excluding samples: Based on the quality control, I do not think I will be excluding any samples for my future analyses.
+
+Get the environment set up for analysis:
+
+```{r}
+# add the required packages
+library(ggplot2)
+library( "DESeq2" )
+library('tidyverse')
+library("fgsea")
+library(knitr)
+library(kableExtra)
+```
+
+Run code to perform differential expression analysis:
+
+```{r}
+# read in the count data and filter out bad read quality
+countData <- as.matrix(read.csv('results/verse/verseFiltered.csv', header=TRUE, sep=',', row.names = "gene"))
+countData <- countData[rowSums(countData < 0) == 0, ]
+
+# read in the col data, put time as factor, and set reference
+colData <- data.frame(samples = colnames(countData), rep = c('CTL','KO','CTL','KO','CTL','KO'), row.names="samples")
+colData$rep <- as.factor(colData$rep)
+colData$rep <- relevel(colData$rep, ref='CTL')
+
+# create a dds object
+dds <- DESeqDataSetFromMatrix(
+  countData=countData,
+  colData=colData,
+  design=~rep
+)
+
+# run DESeq
+dds <- DESeq(dds)
+
+# Extract normalized counts
+normalized_counts <- counts(dds, normalized = TRUE)
+
+# create a results table to compare between samples AD and P0
+results <- results(dds, contrast = c("rep", "CTL", "KO"))
+
+# order the results by p-value
+resOrdered <- results[order(results$pvalue),]
+
+# put the results table to a tibble
+results_tibble <- as_tibble(results, rownames=NA)
+```
+
+Save the deseq2 results into a csv:
+
+```{r}
+write.csv(results, file = "DESeq_results.csv", row.names = FALSE)
+```
+
+Create the sample to sample distance plot:
+
+```{r}
+# Calculate distances between samples
+distances <- dist(t(normalized_counts))
+
+# Perform multidimensional scaling (MDS)
+mds_result <- cmdscale(distances)
+
+# Create a data frame for plotting
+mds_df <- data.frame(MDS1 = mds_result[, 1], MDS2 = mds_result[, 2], Sample = rownames(colData))
+
+# Plot using ggplot2
+library(ggplot2)
+ggplot(mds_df, aes(x = MDS1, y = MDS2, color = Sample)) +
+  geom_point() +
+  labs(title = "Sample-to-Sample Distance Plot (MDS)")
+```
+This plot is used to provide a visual representation of the similarities or dissimilarities between samples based on their gene expression profiles. Samples that are closer together in the plot are more similar to each other in terms of their gene expression profiles, while samples that are farther apart are more dissimilar. From this plot, I would be concerned about the KO rep 3 sample as it does not appear to cluster near the other KO samples. This suggests that the gene expression profile of KO rep 3 is different from the other knockout samples. This may be a technical artifact, biological variation, or other quality control metrics.
+
+
+Look at the top 10 significantly differential expressed genes between CTL and KO:
+
+```{r}
+# Extract the top 10 rows
+top10 <- resOrdered[1:10, ]
+
+# Convert p-values to character format with desired precision
+top10$padj <- format(top10$padj, digits = 10)
+
+# Print the top 10 results as a nicely formatted table
+top10_table <- kable(top10, "html") %>%
+  kable_styling(full_width = FALSE)
+
+# Print the table in R Markdown
+top10_table
+```
+
+From this, we are able to see that ENSG00000129824.16 or RPS4Y1 is the most differential expressed gene between the CTL and KO groupings. Following this, ENSG00000289575.1 and ENSG00000108439.11 also have very small p-values suggesting they are highly differential expressed between the groups. 
+
+Format the data for further analysis and read in the gtf parsed file:
+
+```{r}
+# add an id column with the gene names as values
+results_tibble$id <- rownames(results_tibble)
+
+# read in the gtf, gene file and covert to a tibble
+gene_gtf <- read.csv('references/gencode.v45.annotation.parsed.gtf.txt', sep = ",", col.names = c("id", "geneName"))
+gene_tibble <- as_tibble(gene_gtf)
+
+# merge the gene name information with the results table
+merged_tibble <- merge(results_tibble, gene_tibble, by = "id", all.x = TRUE)
+
+# label the DESEQ results based on log fold change status
+labeled_res <- merged_tibble %>%
+  mutate(volc_plot_status = case_when(
+    padj < 0.1 & log2FoldChange > 0 ~ "UP",
+    padj < 0.1 & log2FoldChange < 0 ~ "DOWN",
+    TRUE ~ "NS"
+))
+```
+
+```{r}
+# remove the duplicated genes before analysis - they arent significant 
+labeled_res <- labeled_res[!duplicated(labeled_res$geneName), ]
+```
+
+Create a histogram showing the distribution of log2FoldChanges of your DE genes:
+
+```{r}
+# Filter out non-significant DE genes and non-finite log2FoldChange values
+DE_genes <- labeled_res[!is.na(labeled_res$padj) & labeled_res$padj < 0.1, ]
+
+# Create histogram
+ggplot(DE_genes, aes(x = log2FoldChange)) +
+  geom_histogram(binwidth = 0.5, fill = "skyblue", color = "black") +
+  labs(x = "log2FoldChange", y = "Frequency", title = "Distribution of log2FoldChanges of DE genes")
+
+# Get the number of rows in the filtered dataframe
+num_rows <- nrow(DE_genes)
+
+# Print the number of rows
+print(num_rows)
+```
+The threshold that I chose here for a p-value is 0.01. At this threshold, 1841 genes are significant.
+
+Create a volcano plot that distinguishes between significant and non-significant DE genes as well as labels for up and downregulated genes. Label the top ten most significant genes with their associated gene name / gene symbol.
+```{r}
+# Define significance threshold
+alpha <- 0.01
+
+# Filter out non-significant DE genes and non-finite log2FoldChange values
+labeled_res <- labeled_res[!is.na(labeled_res$padj), ]
+
+# Create volcano plot
+volcano_plot <- ggplot(labeled_res, aes(x = log2FoldChange, y = -log10(padj), color = volc_plot_status)) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("UP" = "darkgreen", "DOWN" = "pink", "NS" = "grey")) +
+  labs(x = "log2FoldChange", y = "-log10(padj)", title = "Volcano Plot of DE Genes") +
+  theme_minimal()
+
+# Label top ten most significant genes
+top_significant_genes <- head(merged_tibble[order(merged_tibble$padj), ], 10)
+volcano_plot <- volcano_plot +
+  geom_text(data = top_significant_genes, aes(label = geneName), 
+            hjust = 0, vjust = 1.5, size = 1.5, color = "black")
+
+# Print volcano plot
+print(volcano_plot)
+```
+
+Perform a GSEA (FGSEA) analysis on all the genes discovered in the experiment. Rank based on padj values.
+Using the C2 canonical pathways database. Pull out the top 10 significant results.
+```{r}
+# read in the gmt file
+gmt_file <- gmtPathways("references/c2.cp.v2023.2.Hs.symbols.gmt")
+
+# make the ranked gene list 
+labeled_res <- labeled_res %>%
+  arrange(desc(abs(log2FoldChange)))
+rnk_list <- setNames(labeled_res$log2FoldChange, labeled_res$geneName)
+
+# run fgsea
+fgsea_results <- fgsea(gmt_file, rnk_list, minSize = 15, maxSize= 500)
+```
+
+```{r}
+fgseatop <- fgsea_results[order(fgsea_results$padj),]
+
+fgseatop10 <- fgseatop[1:10, ]
+
+# Convert p-values to character format with desired precision
+fgseatop10$padj <- format(fgseatop10$padj, digits = 10)
+fgseatop10$pval <- format(fgseatop10$pval, digits = 10)
+
+# Print the top 10 results as a nicely formatted table
+top10_tablefgsea <- kable(fgseatop10, "html") %>%
+  kable_styling(full_width = FALSE)
+
+# Print the table in R Markdown
+top10_tablefgsea
+```
+
+Pull out genes for the DAVID analysis - this pulls out 464 IDs that are able to be used for analyisis
+```{r}
+# extract the genes differential expressed at a level of 0.001
+david_genes <- labeled_res[!is.na(labeled_res$padj) & labeled_res$padj < 0.001, ] 
+# Extract the 'id' column from DE_genes
+id_column <- david_genes$id
+id_column <- gsub("\\..*", "", id_column)
+# Write the id column to a new file
+writeLines(id_column, "id_DAVID.txt")
+```
+
+```{r, dup rate}
+knitr::include_graphics("/projectnb/bf528/students/marcotts/bf528-individual-project-Sop51/GO1.png")
+```
+```{r, dup rate}
+knitr::include_graphics("/projectnb/bf528/students/marcotts/bf528-individual-project-Sop51/GO2.png")
+```
+
+```{r, dup rate}
+knitr::include_graphics("/projectnb/bf528/students/marcotts/bf528-individual-project-Sop51/GO3.png")
+```
+
+Yes, there are differences between the two analysis, but nothing notable. I would expect there to be differences as they are two different software that likely perform the analysis in different ways. However, there are also similarities. For example, given that TNFR-Cys 3 is enriched in the DAVID analysis, it's possible that it is part of or interacts with pathways downstream of p53 signaling pathway found to be enriched within the gsea analysis. From this information, we could infer that genes are affected that relate to signaling cascades activated by TNF receptor family members. This infers that the KO cells likely are being affected in a way that has disease implications.
